@@ -1,0 +1,12 @@
+[Unit]
+Description=sonum - local server HTTP/JSON for music library
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/sonum/target/release/sonum
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
