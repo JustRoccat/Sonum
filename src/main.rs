@@ -4,6 +4,7 @@ mod duplicates;
 mod events;
 mod groups;
 mod handlers;
+mod library_db;
 mod lyrics;
 mod metrics;
 mod ratelimit;
@@ -21,6 +22,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use anyhow::Context;
 use axum::{
     Router,
     routing::{get, post},
@@ -32,6 +34,7 @@ use tower_http::{
     services::ServeDir, trace::TraceLayer,
 };
 
+use crate::library_db::LibraryDb;
 use crate::ratelimit::RateLimiter;
 use crate::state::{AppState, ScanMeta, compute_music_dir_labels};
 
@@ -61,7 +64,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let (tracks, scan_duration) = scan::timed_scan(&config.music_dirs);
+    let library_db = Arc::new(
+        LibraryDb::open(&config.db_path)
+            .with_context(|| format!("couldn't open library db at {}", config.db_path.display()))?,
+    );
+    tracing::info!("Library db: {}", config.db_path.display());
+
+    let (tracks, scan_duration) = scan::timed_scan(&config.music_dirs, &library_db);
     tracing::info!(
         "Indexed {} tracks from {} music dir(s) (in {} ms)",
         tracks.len(),
@@ -106,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter: RateLimiter::new(config.rate_limit_per_min, Duration::from_secs(60)),
         ffmpeg_available,
         events: events_tx,
+        library_db: library_db.clone(),
     });
 
     let _watcher = scan::spawn_music_dir_watcher(state.clone())?;

@@ -9,14 +9,17 @@ use anyhow::Context;
 use lofty::{file::AudioFile, prelude::*, probe::Probe, tag::ItemKey};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::library_db::{LibraryDb, fingerprint_file};
 use crate::state::{AppState, LibraryEvent, ScanMeta, Track};
-use crate::util::short_hash;
 
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "opus", "m4a", "wav", "aac"];
 
-pub(crate) fn timed_scan(music_dirs: &[PathBuf]) -> (HashMap<String, Track>, Duration) {
+pub(crate) fn timed_scan(
+    music_dirs: &[PathBuf],
+    db: &LibraryDb,
+) -> (HashMap<String, Track>, Duration) {
     let started = Instant::now();
-    let tracks = scan_all_libraries(music_dirs);
+    let tracks = scan_all_libraries(music_dirs, db);
     (tracks, started.elapsed())
 }
 
@@ -30,14 +33,16 @@ fn preserve_added_at(new_tracks: &mut HashMap<String, Track>, old_tracks: &HashM
 
 pub(crate) async fn perform_scan(state: &Arc<AppState>) -> usize {
     let music_dirs = state.music_dirs.clone();
+    let db = state.library_db.clone();
     let old_tracks = state.tracks.read().await.clone();
 
-    let (mut new_tracks, duration) = tokio::task::spawn_blocking(move || timed_scan(&music_dirs))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("background scan blew up: {e}");
-            (HashMap::new(), Duration::default())
-        });
+    let (mut new_tracks, duration) =
+        tokio::task::spawn_blocking(move || timed_scan(&music_dirs, &db))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("background scan blew up: {e}");
+                (HashMap::new(), Duration::default())
+            });
     preserve_added_at(&mut new_tracks, &old_tracks);
 
     let count = new_tracks.len();
@@ -66,16 +71,32 @@ pub(crate) async fn perform_incremental_scan(
     changed_paths: Vec<PathBuf>,
 ) -> usize {
     let music_dirs = state.music_dirs.clone();
+    let db = state.library_db.clone();
     let snapshot = state.tracks.read().await.clone();
 
     let (updated_tracks, duration) = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let mut tracks = snapshot;
+
+        let mut existing = Vec::new();
+        let mut missing = Vec::new();
         for path in changed_paths {
             if let Some(root) = find_root_for_path(&music_dirs, &path) {
-                apply_path_change(root, &music_dirs[root], &path, &mut tracks);
+                if path.is_dir() || path.is_file() {
+                    existing.push((root, path));
+                } else {
+                    missing.push((root, path));
+                }
             }
         }
+
+        for (root, path) in existing {
+            apply_path_change(root, &music_dirs[root], &path, &mut tracks, &db);
+        }
+        for (root, path) in missing {
+            apply_path_change(root, &music_dirs[root], &path, &mut tracks, &db);
+        }
+
         (tracks, started.elapsed())
     })
     .await
@@ -106,6 +127,7 @@ fn apply_path_change(
     root_dir: &Path,
     changed_path: &Path,
     tracks: &mut HashMap<String, Track>,
+    db: &LibraryDb,
 ) {
     let Ok(rel) = changed_path.strip_prefix(root_dir) else {
         // event outside this root (shouldnt happen, but be defensive)
@@ -123,7 +145,24 @@ fn apply_path_change(
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
-            if let Some(track) = try_read_one(root, root_dir, entry.path()) {
+            if let Some(track) = try_read_one(root, root_dir, entry.path(), db) {
+                let entry_path = entry.path();
+                let entry_relative_path = track.relative_path.clone();
+                let track = resolve_guid_collision(
+                    root,
+                    &entry_relative_path,
+                    entry_path,
+                    track,
+                    db,
+                    tracks,
+                    |r, rp| {
+                        if r == root {
+                            root_dir.join(rp).exists()
+                        } else {
+                            false
+                        }
+                    },
+                );
                 tracks.insert(track.id.clone(), track);
             }
         }
@@ -131,14 +170,35 @@ fn apply_path_change(
     }
 
     if changed_path.is_file() {
-        if let Some(track) = try_read_one(root, root_dir, changed_path) {
+        if let Some(track) = try_read_one(root, root_dir, changed_path, db) {
+            let track_relative_path = track.relative_path.clone();
+            let track = resolve_guid_collision(
+                root,
+                &track_relative_path,
+                changed_path,
+                track,
+                db,
+                tracks,
+                |r, rp| {
+                    if r == root {
+                        root_dir.join(rp).exists()
+                    } else {
+                        false
+                    }
+                },
+            );
             tracks.insert(track.id.clone(), track);
         }
         return;
     }
 
-    tracks.remove(&track_id(root, &rel_path));
     remove_prefixed(tracks, root, &rel_path);
+    if let Err(e) = db.remove_path(root, &rel_path) {
+        tracing::warn!("library db: couldn't remove '{rel_path}': {e}");
+    }
+    if let Err(e) = db.remove_prefix(root, &rel_path) {
+        tracing::warn!("library db: couldn't remove entries under '{rel_path}/': {e}");
+    }
 }
 
 fn remove_prefixed(tracks: &mut HashMap<String, Track>, root: usize, rel_path: &str) {
@@ -148,7 +208,7 @@ fn remove_prefixed(tracks: &mut HashMap<String, Track>, root: usize, rel_path: &
     });
 }
 
-fn try_read_one(root: usize, root_dir: &Path, path: &Path) -> Option<Track> {
+fn try_read_one(root: usize, root_dir: &Path, path: &Path, db: &LibraryDb) -> Option<Track> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -161,7 +221,7 @@ fn try_read_one(root: usize, root_dir: &Path, path: &Path) -> Option<Track> {
         Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
         Err(_) => return None,
     };
-    match read_track_metadata(root, path, &relative_path, &ext) {
+    match read_track_metadata(root, path, &relative_path, &ext, db) {
         Ok(track) => Some(track),
         Err(e) => {
             tracing::warn!("Skipped '{}': {e}", path.display());
@@ -232,19 +292,39 @@ fn collect_event_paths(res: notify::Result<Event>, changed: &mut HashSet<PathBuf
     }
 }
 
-fn scan_all_libraries(music_dirs: &[PathBuf]) -> HashMap<String, Track> {
-    let mut tracks = HashMap::new();
+fn scan_all_libraries(music_dirs: &[PathBuf], db: &LibraryDb) -> HashMap<String, Track> {
+    let mut tracks: HashMap<String, Track> = HashMap::new();
     for (root, dir) in music_dirs.iter().enumerate() {
-        for (id, track) in scan_library(root, dir) {
-            tracks.insert(id, track);
+        scan_library_into(root, dir, db, music_dirs, &mut tracks);
+
+        let seen_guids: HashSet<String> = tracks
+            .iter()
+            .filter(|(_, t)| t.root == root)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Err(e) = db.prune_missing_for_root(root, &seen_guids) {
+            tracing::warn!("library db: couldn't prune missing entries for root {root}: {e}");
         }
     }
     tracks
 }
 
-fn scan_library(root: usize, music_dir: &Path) -> HashMap<String, Track> {
+#[cfg(test)]
+fn scan_library(root: usize, music_dir: &Path, db: &LibraryDb) -> HashMap<String, Track> {
     let mut tracks = HashMap::new();
+    let mut dirs = vec![PathBuf::new(); root + 1];
+    dirs[root] = music_dir.to_path_buf();
+    scan_library_into(root, music_dir, db, &dirs, &mut tracks);
+    tracks
+}
 
+fn scan_library_into(
+    root: usize,
+    music_dir: &Path,
+    db: &LibraryDb,
+    music_dirs: &[PathBuf],
+    tracks: &mut HashMap<String, Track>,
+) {
     for entry in walkdir::WalkDir::new(music_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -266,8 +346,22 @@ fn scan_library(root: usize, music_dir: &Path) -> HashMap<String, Track> {
             Err(_) => continue,
         };
 
-        match read_track_metadata(root, path, &relative_path, &ext) {
+        match read_track_metadata(root, path, &relative_path, &ext, db) {
             Ok(track) => {
+                let track = resolve_guid_collision(
+                    root,
+                    &relative_path,
+                    path,
+                    track,
+                    db,
+                    tracks,
+                    |r, rp| {
+                        music_dirs
+                            .get(r)
+                            .map(|d| d.join(rp).exists())
+                            .unwrap_or(false)
+                    },
+                );
                 tracks.insert(track.id.clone(), track);
             }
             Err(e) => {
@@ -275,12 +369,37 @@ fn scan_library(root: usize, music_dir: &Path) -> HashMap<String, Track> {
             }
         }
     }
-
-    tracks
 }
 
-fn track_id(root: usize, relative_path: &str) -> String {
-    short_hash(&format!("{root}:{relative_path}"))
+fn resolve_guid_collision(
+    root: usize,
+    relative_path: &str,
+    path: &Path,
+    mut track: Track,
+    db: &LibraryDb,
+    known: &HashMap<String, Track>,
+    still_exists: impl Fn(usize, &str) -> bool,
+) -> Track {
+    if let Some(existing) = known.get(&track.id) {
+        let same_file = existing.root == root && existing.relative_path == relative_path;
+        if !same_file && still_exists(existing.root, &existing.relative_path) {
+            match fingerprint_file(path) {
+                Ok(fingerprint) => match db.assign_new_guid(root, relative_path, &fingerprint) {
+                    Ok(new_id) => {
+                        track.stream_url = format!("/tracks/{new_id}/stream");
+                        track.id = new_id;
+                    }
+                    Err(e) => tracing::warn!(
+                        "library db: couldn't assign a fresh id for '{relative_path}' after a fingerprint collision: {e}"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    "couldn't re-fingerprint '{relative_path}' to resolve a guid collision: {e}"
+                ),
+            }
+        }
+    }
+    track
 }
 
 fn file_added_at(path: &Path) -> u64 {
@@ -309,6 +428,10 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn test_db() -> LibraryDb {
+        LibraryDb::open(Path::new(":memory:")).expect("open in-memory library db")
+    }
 
     fn write_minimal_wav(path: &Path, num_samples: u32) {
         let sample_rate: u32 = 44_100;
@@ -355,7 +478,7 @@ mod tests {
         fs::create_dir(dir.path().join("Artist")).unwrap();
         write_minimal_wav(&dir.path().join("Artist/another.wav"), 500);
 
-        let tracks = scan_library(0, dir.path());
+        let tracks = scan_library(0, dir.path(), &test_db());
 
         assert_eq!(tracks.len(), 2);
         let titles: HashSet<String> = tracks.values().map(|t| t.title.clone()).collect();
@@ -369,7 +492,7 @@ mod tests {
         fs::create_dir(dir.path().join("My Album")).unwrap();
         write_minimal_wav(&dir.path().join("My Album/Track One.wav"), 200);
 
-        let tracks = scan_library(0, dir.path());
+        let tracks = scan_library(0, dir.path(), &test_db());
         assert_eq!(tracks.len(), 1);
         let track = tracks.values().next().unwrap();
         assert_eq!(track.title, "Track One");
@@ -384,7 +507,10 @@ mod tests {
         write_minimal_wav(&dir_a.path().join("song.wav"), 100);
         write_minimal_wav(&dir_b.path().join("song.wav"), 100);
 
-        let tracks = scan_all_libraries(&[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]);
+        let tracks = scan_all_libraries(
+            &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            &test_db(),
+        );
         assert_eq!(tracks.len(), 2);
         let roots: HashSet<usize> = tracks.values().map(|t| t.root).collect();
         assert_eq!(roots, HashSet::from([0, 1]));
@@ -397,7 +523,7 @@ mod tests {
 
         let file_path = dir.path().join("new_song.wav");
         write_minimal_wav(&file_path, 100);
-        apply_path_change(0, dir.path(), &file_path, &mut tracks);
+        apply_path_change(0, dir.path(), &file_path, &mut tracks, &test_db());
 
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks.values().next().unwrap().title, "new_song");
@@ -409,11 +535,12 @@ mod tests {
         let file_path = dir.path().join("song.wav");
         write_minimal_wav(&file_path, 100);
 
-        let mut tracks = scan_library(0, dir.path());
+        let db = test_db();
+        let mut tracks = scan_library(0, dir.path(), &db);
         assert_eq!(tracks.len(), 1);
 
         fs::remove_file(&file_path).unwrap();
-        apply_path_change(0, dir.path(), &file_path, &mut tracks);
+        apply_path_change(0, dir.path(), &file_path, &mut tracks, &db);
 
         assert!(tracks.is_empty());
     }
@@ -428,11 +555,12 @@ mod tests {
         // a track outside the directory that's about to be deleted
         write_minimal_wav(&dir.path().join("unrelated.wav"), 100);
 
-        let mut tracks = scan_library(0, dir.path());
+        let db = test_db();
+        let mut tracks = scan_library(0, dir.path(), &db);
         assert_eq!(tracks.len(), 3);
 
         fs::remove_dir_all(&album_dir).unwrap();
-        apply_path_change(0, dir.path(), &album_dir, &mut tracks);
+        apply_path_change(0, dir.path(), &album_dir, &mut tracks, &db);
 
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks.values().next().unwrap().title, "unrelated");
@@ -445,14 +573,69 @@ mod tests {
         fs::create_dir(&album_dir).unwrap();
         write_minimal_wav(&album_dir.join("one.wav"), 100);
 
-        let mut tracks = scan_library(0, dir.path());
+        let db = test_db();
+        let mut tracks = scan_library(0, dir.path(), &db);
         assert_eq!(tracks.len(), 1);
 
         // a second file shows up in the same directory
         write_minimal_wav(&album_dir.join("two.wav"), 100);
-        apply_path_change(0, dir.path(), &album_dir, &mut tracks);
+        apply_path_change(0, dir.path(), &album_dir, &mut tracks, &db);
 
         assert_eq!(tracks.len(), 2);
+    }
+
+    #[test]
+    fn renaming_a_file_keeps_its_track_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_path = dir.path().join("old_name.wav");
+        write_minimal_wav(&old_path, 100);
+
+        let db = test_db();
+        let mut tracks = scan_library(0, dir.path(), &db);
+        assert_eq!(tracks.len(), 1);
+        let original_id = tracks.values().next().unwrap().id.clone();
+
+        let new_path = dir.path().join("new_name.wav");
+        fs::rename(&old_path, &new_path).unwrap();
+
+        apply_path_change(0, dir.path(), &new_path, &mut tracks, &db);
+        apply_path_change(0, dir.path(), &old_path, &mut tracks, &db);
+
+        assert_eq!(tracks.len(), 1);
+        let renamed = tracks.values().next().unwrap();
+        assert_eq!(renamed.id, original_id);
+        assert_eq!(renamed.relative_path, "new_name.wav");
+    }
+
+    #[test]
+    fn moving_the_whole_library_dir_preserves_all_track_ids() {
+        let old_dir = tempfile::tempdir().expect("tempdir");
+        write_minimal_wav(&old_dir.path().join("a.wav"), 100);
+        write_minimal_wav(&old_dir.path().join("b.wav"), 200);
+
+        let db = test_db();
+        let before = scan_library(0, old_dir.path(), &db);
+        let mut ids_before: Vec<String> = before.values().map(|t| t.id.clone()).collect();
+        ids_before.sort();
+
+        let new_dir = tempfile::tempdir().expect("tempdir");
+        fs::rename(old_dir.path(), new_dir.path().join("moved")).unwrap_or_else(|_| {
+            fs::create_dir_all(new_dir.path().join("moved")).unwrap();
+            for entry in fs::read_dir(old_dir.path()).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(
+                    entry.path(),
+                    new_dir.path().join("moved").join(entry.file_name()),
+                )
+                .unwrap();
+            }
+        });
+
+        let after = scan_library(0, &new_dir.path().join("moved"), &db);
+        let mut ids_after: Vec<String> = after.values().map(|t| t.id.clone()).collect();
+        ids_after.sort();
+
+        assert_eq!(ids_before, ids_after);
     }
 
     #[test]
@@ -495,6 +678,7 @@ fn read_track_metadata(
     path: &Path,
     relative_path: &str,
     ext: &str,
+    db: &LibraryDb,
 ) -> anyhow::Result<Track> {
     let probe_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Probe::open(path).and_then(|p| p.read())
@@ -573,7 +757,11 @@ fn read_track_metadata(
     let track_number = tag.and_then(|t| t.track());
     let disc_number = tag.and_then(|t| t.disk());
 
-    let id = track_id(root, relative_path);
+    let fingerprint = fingerprint_file(path)
+        .with_context(|| format!("couldn't fingerprint '{}'", path.display()))?;
+    let id = db
+        .resolve_guid(root, relative_path, &fingerprint)
+        .with_context(|| format!("library db: couldn't resolve id for '{}'", path.display()))?;
 
     Ok(Track {
         id: id.clone(),

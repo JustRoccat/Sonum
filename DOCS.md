@@ -16,7 +16,7 @@ Without a valid token, the server returns `401 Unauthorized`. If `api_token` is 
 
 Sonum can scan more than one folder as a single combined library - see `music_dir`/`music_dirs` in the config file (README has the full syntax). Each configured folder gets a numeric **root index** (0, 1, 2, ... in config order). That index shows up in two places:
 
-- Track ids are unique per `(root, relative path)` pair, so the same relative path in two different folders never collides.
+- Track ids are content-derived GUIDs (see "Track object" below), so the same relative path in two different folders never collides, and moving a file between roots keeps its id.
 - `/files/:root/*path` serves files from a specific root - see below.
 
 If you only configure one folder (the default), everything behaves exactly as before, just always under root `0`.
@@ -46,7 +46,9 @@ Many endpoints return a track object in this format:
 }
 ```
 
-The `id` field is a SHA-256 hash of `"{root}:{relative path}"` (the first 8 bytes, written as hex). It stays the same as long as the file's root/path does not change.
+The `id` field is a randomly generated, persistent GUID, stored in a small SQLite database (`library.sqlite`, next to `sonum.conf`) alongside a content fingerprint of the file. Unlike a path-derived id, it **survives renames, moves within a root, and moving the whole library folder somewhere else**: on every (re)scan, Sonum fingerprints each file and looks it up by content first, so a file that shows up at a new path with the same bytes keeps its old id instead of minting a new one. This is what keeps client-side playlists, favorites, and "resume position" data from silently breaking when you reorganize your files on disk.
+
+If a file is genuinely deleted (its content doesn't reappear anywhere else in the library), its row is removed from `library.sqlite` too, so the database never accumulates stale entries.
 
 If a file has no title tag, Sonum uses the file name as the title. If it has no artist tag, Sonum uses "Unknown Artist". If it has no album tag, Sonum uses the name of the folder the file is in.
 

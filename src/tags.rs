@@ -15,6 +15,7 @@ use lofty::{
 };
 use serde::Deserialize;
 
+use crate::library_db::fingerprint_file;
 use crate::state::{AppState, LibraryEvent, Track};
 
 #[derive(Debug, Deserialize, Default)]
@@ -65,8 +66,16 @@ pub(crate) async fn patch_track_tags(
     };
 
     let path = state.track_abs_path(&track);
-    let write_result =
-        tokio::task::spawn_blocking(move || write_tags(&path, &edits).map(|()| edits)).await;
+    let db = state.library_db.clone();
+    let root = track.root;
+    let relative_path = track.relative_path.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        write_tags(&path, &edits)?;
+        let fingerprint = fingerprint_file(&path)?;
+        db.resolve_guid(root, &relative_path, &fingerprint)?;
+        Ok::<_, anyhow::Error>(edits)
+    })
+    .await;
 
     let edits = match write_result {
         Ok(Ok(edits)) => edits,

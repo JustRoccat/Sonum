@@ -147,4 +147,5 @@ Report bugs and suggest changes through issues or pull requests in the repositor
 - `art.rs`: finds album art and generates thumbnails.
 - `tree.rs`: builds the folder structure as a tree.
 - `metrics.rs`: exposes server metrics in Prometheus format.
-- `util.rs`: small helper functions, such as generating a track ID.
+- `util.rs`: small helper functions.
+- `library_db.rs`: SQLite-backed persistent track GUIDs, content fingerprinting, and move/rename/deletion detection - see `DOCS.md` for the "Track object" section.

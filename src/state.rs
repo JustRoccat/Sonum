@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
     sync::atomic::AtomicU64,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -9,6 +10,7 @@ use serde::Serialize;
 use tokio::sync::{RwLock, broadcast};
 
 use crate::art::CachedArt;
+use crate::library_db::LibraryDb;
 use crate::lyrics::LyricsResponse;
 use crate::ratelimit::RateLimiter;
 
@@ -72,6 +74,7 @@ pub(crate) struct AppState {
     pub(crate) rate_limiter: RateLimiter,
     pub(crate) ffmpeg_available: bool,
     pub(crate) events: broadcast::Sender<LibraryEvent>,
+    pub(crate) library_db: Arc<LibraryDb>,
 }
 
 impl AppState {

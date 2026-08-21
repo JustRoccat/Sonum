@@ -8,6 +8,7 @@ const DEFAULT_RATE_LIMIT_PER_MIN: u32 = 300;
 pub(crate) struct Config {
     pub(crate) config_dir: PathBuf,
     pub(crate) conf_path: PathBuf,
+    pub(crate) db_path: PathBuf,
 
     pub(crate) music_dirs: Vec<PathBuf>,
     pub(crate) bind_addr: SocketAddr,
@@ -158,6 +159,7 @@ pub(crate) fn load_or_create_config() -> anyhow::Result<Config> {
         .with_context(|| format!("couldn't create dir {}", config_dir.display()))?;
 
     let conf_path = config_dir.join("sonum.conf");
+    let db_path = config_dir.join("library.sqlite");
     let default_music_dir = config_dir.join("music");
 
     if !conf_path.exists() {
@@ -215,6 +217,7 @@ pub(crate) fn load_or_create_config() -> anyhow::Result<Config> {
     Ok(Config {
         config_dir,
         conf_path,
+        db_path,
         music_dirs,
         bind_addr,
         api_token: parsed.api_token,
