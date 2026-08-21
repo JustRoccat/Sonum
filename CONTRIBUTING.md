@@ -4,7 +4,7 @@ Thanks for your interest in improving Sonum. This guide covers how to set up the
 
 ## Getting started
 
-You need Rust installed, ideally the latest stable version. Clone the repository and build it:
+You need Rust installed - **1.85 or newer** (the project uses the 2024 edition). Clone the repository and build it:
 
 ```bash
 git clone <repository url>
@@ -30,11 +30,17 @@ Each file in the project has one clear job:
 | `config.rs` | Reading and writing the config file |
 | `state.rs` | Shared application state and the `Track` type |
 | `handlers.rs` | Core endpoints: list, get, stream, health, rescan, auth |
-| `scan.rs` | Scanning the music folder and reading tags |
+| `scan.rs` | Scanning music folders (multi-root) and reading tags |
+| `tags.rs` | Writing tag edits back to files (`PATCH /tracks/:id`) |
+| `duplicates.rs` | Heuristic duplicate-track detection (`/duplicates`) |
+| `events.rs` | Server-Sent Events stream of library changes (`/events`) |
+| `groups.rs` | Grouping tracks into albums/artists |
 | `lyrics.rs` | Finding and parsing lyrics |
-| `art.rs` | Finding album art |
+| `art.rs` | Finding album art, including thumbnail resizing |
 | `tree.rs` | Building the folder tree |
 | `metrics.rs` | Prometheus metrics |
+| `ratelimit.rs` | Per-IP request rate limiting |
+| `transcode.rs` | On-the-fly ffmpeg transcoding and seek approximation |
 | `util.rs` | Small helper functions |
 
 If you add a feature that does not fit any of these, it is fine to add a new module instead of stretching an existing one.

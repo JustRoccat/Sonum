@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -16,13 +16,21 @@ pub(crate) struct TreeNode {
 
 pub(crate) async fn get_tree(State(state): State<Arc<AppState>>) -> Json<TreeNode> {
     let tracks = state.tracks.read().await;
-    let mut root = TreeNode {
-        name: "root".to_string(),
-        children: Vec::new(),
-        track_ids: Vec::new(),
-    };
+
+    let mut root_nodes: Vec<TreeNode> = state
+        .music_dir_labels
+        .iter()
+        .map(|label| TreeNode {
+            name: label.clone(),
+            children: Vec::new(),
+            track_ids: Vec::new(),
+        })
+        .collect();
 
     for track in tracks.values() {
+        let Some(root_node) = root_nodes.get_mut(track.root) else {
+            continue; // defensive: shouldnt happen, id would be stale
+        };
         let parts: Vec<&str> = track
             .relative_path
             .split('/')
@@ -31,9 +39,18 @@ pub(crate) async fn get_tree(State(state): State<Arc<AppState>>) -> Json<TreeNod
         if parts.is_empty() {
             continue;
         }
-        insert_into_tree(&mut root, &parts, &track.id);
+        insert_into_tree(root_node, &parts, &track.id);
     }
-    sort_tree(&mut root);
+
+    for root_node in root_nodes.iter_mut() {
+        sort_tree(root_node);
+    }
+
+    let root = TreeNode {
+        name: "root".to_string(),
+        children: root_nodes,
+        track_ids: Vec::new(),
+    };
     Json(root)
 }
 

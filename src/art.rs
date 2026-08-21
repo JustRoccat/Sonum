@@ -7,7 +7,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use lofty::{prelude::*, probe::Probe};
@@ -32,6 +32,8 @@ const FOLDER_ART_NAMES: &[&str] = &[
     "front.webp",
 ];
 
+const THUMBNAIL_MAX_DIMENSION: u32 = 300;
+
 const PLACEHOLDER_ART_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
   <rect width="300" height="300" fill="#2a2a2e"/>
   <path d="M120 210c0 16.6-13.4 30-30 30s-30-13.4-30-30 13.4-30 30-30c5.5 0 10.6 1.5 15 4V70l120-24v130c0 16.6-13.4 30-30 30s-30-13.4-30-30 13.4-30 30-30c5.5 0 10.6 1.5 15 4V96l-90 18v96z" fill="#6b6b72"/>
@@ -44,9 +46,34 @@ pub(crate) struct CachedArt {
     source: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtSize {
+    Full,
+    Thumbnail,
+}
+
+impl ArtSize {
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "thumbnail" | "thumb" => Some(Self::Thumbnail),
+            _ => None,
+        }
+    }
+
+    fn cache_suffix(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Thumbnail => "thumb",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ArtQuery {
     placeholder: Option<bool>,
+
+    size: Option<String>,
 }
 
 pub(crate) async fn get_art(
@@ -55,8 +82,22 @@ pub(crate) async fn get_art(
     Query(query): Query<ArtQuery>,
 ) -> Response {
     let want_placeholder = query.placeholder.unwrap_or(true);
+    let size = match query.size.as_deref() {
+        Some(s) => match ArtSize::parse(s) {
+            Some(size) => size,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Unsupported 'size'. Use one of: full, thumbnail.",
+                )
+                    .into_response();
+            }
+        },
+        None => ArtSize::Full,
+    };
+    let cache_key = format!("{id}:{}", size.cache_suffix());
 
-    if let Some(cached) = state.art_cache.read().await.get(&id).cloned() {
+    if let Some(cached) = state.art_cache.read().await.get(&cache_key).cloned() {
         return render_art_response(cached, want_placeholder);
     }
 
@@ -68,15 +109,19 @@ pub(crate) async fn get_art(
         }
     };
 
-    let full_path = state.music_dir.join(&track.relative_path);
-    let cached = tokio::task::spawn_blocking(move || resolve_art(&full_path))
+    let full_path = state.track_abs_path(&track);
+    let cached = tokio::task::spawn_blocking(move || resolve_art(&full_path, size))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!("Art lookup thread panicked: {e}");
             None
         });
 
-    state.art_cache.write().await.insert(id, cached.clone());
+    state
+        .art_cache
+        .write()
+        .await
+        .insert(cache_key, cached.clone());
     render_art_response(cached, want_placeholder)
 }
 
@@ -110,39 +155,51 @@ fn render_art_response(cached: Option<CachedArt>, want_placeholder: bool) -> Res
     }
 }
 
-fn resolve_art(audio_path: &Path) -> Option<CachedArt> {
+fn resolve_art(audio_path: &Path, size: ArtSize) -> Option<CachedArt> {
     let dir = audio_path.parent().unwrap_or(audio_path);
     let stem = audio_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    if let Some((bytes, mime)) = try_embedded_art(audio_path) {
-        return Some(CachedArt {
-            bytes: Arc::new(bytes),
-            mime,
-            source: "embedded",
-        });
-    }
-    if let Some(path) = try_folder_art(dir) {
-        if let Some((bytes, mime)) = read_image_file(&path) {
-            return Some(CachedArt {
-                bytes: Arc::new(bytes),
-                mime,
-                source: "folder",
-            });
-        }
-    }
-    if let Some(path) = try_track_named_art(dir, stem) {
-        if let Some((bytes, mime)) = read_image_file(&path) {
-            return Some(CachedArt {
-                bytes: Arc::new(bytes),
-                mime,
-                source: "track_named",
-            });
-        }
-    }
-    None
+    let found: Option<(Vec<u8>, String, &'static str)> =
+        if let Some((bytes, mime)) = try_embedded_art(audio_path) {
+            Some((bytes, mime, "embedded"))
+        } else if let Some((bytes, mime)) = try_folder_art(dir).and_then(|p| read_image_file(&p)) {
+            Some((bytes, mime, "folder"))
+        } else if let Some((bytes, mime)) =
+            try_track_named_art(dir, stem).and_then(|p| read_image_file(&p))
+        {
+            Some((bytes, mime, "track_named"))
+        } else {
+            None
+        };
+
+    let (bytes, mime, source) = found?;
+    let (bytes, mime) = match size {
+        ArtSize::Full => (bytes, mime),
+        ArtSize::Thumbnail => match make_thumbnail(&bytes) {
+            Some(thumb) => (thumb, "image/jpeg".to_string()),
+
+            None => (bytes, mime),
+        },
+    };
+
+    Some(CachedArt {
+        bytes: Arc::new(bytes),
+        mime,
+        source,
+    })
+}
+
+fn make_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let resized = img.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
+
+    let rgb = image::DynamicImage::ImageRgb8(resized.to_rgb8());
+    let mut out = std::io::Cursor::new(Vec::new());
+    rgb.write_to(&mut out, image::ImageFormat::Jpeg).ok()?;
+    Some(out.into_inner())
 }
 
 fn try_embedded_art(path: &Path) -> Option<(Vec<u8>, String)> {

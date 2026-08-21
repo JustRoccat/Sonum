@@ -83,11 +83,16 @@ pub(crate) async fn get_lyrics(
         }
     };
 
-    let full_path = state.music_dir.join(&track.relative_path);
+    let full_path = state.track_abs_path(&track);
+    let root_dir = state
+        .music_dirs
+        .get(track.root)
+        .cloned()
+        .unwrap_or_default();
     let dir = full_path
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| state.music_dir.clone());
+        .unwrap_or(root_dir);
     let stem = full_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -136,25 +141,24 @@ fn resolve_lyrics(
         }
     }
 
-    if let Some(path) = find_case_insensitive_sibling(dir, stem, "lrc") {
-        if let Some(raw) = read_text_file_lossy(&path) {
-            let parsed = parse_lyrics_content(&raw);
-            let resp = LyricsResponse::from_parsed(id, "track_lrc", parsed);
-            if resp.source != "none" {
-                return resp;
-            }
+    if let Some(path) = find_case_insensitive_sibling(dir, stem, "lrc")
+        && let Some(raw) = read_text_file_lossy(&path)
+    {
+        let parsed = parse_lyrics_content(&raw);
+        let resp = LyricsResponse::from_parsed(id, "track_lrc", parsed);
+        if resp.source != "none" {
+            return resp;
         }
     }
 
-    if sibling_audio_count == 1 {
-        if let Some(path) = find_shared_lrc_candidate(dir) {
-            if let Some(raw) = read_text_file_lossy(&path) {
-                let parsed = parse_lyrics_content(&raw);
-                let resp = LyricsResponse::from_parsed(id, "shared_lrc", parsed);
-                if resp.source != "none" {
-                    return resp;
-                }
-            }
+    if sibling_audio_count == 1
+        && let Some(path) = find_shared_lrc_candidate(dir)
+        && let Some(raw) = read_text_file_lossy(&path)
+    {
+        let parsed = parse_lyrics_content(&raw);
+        let resp = LyricsResponse::from_parsed(id, "shared_lrc", parsed);
+        if resp.source != "none" {
+            return resp;
         }
     }
 
