@@ -19,7 +19,17 @@ Sonum is a simple music server you can run on your own computer or server. It sc
 - It rate-limits requests per IP to blunt accidental or intentional abuse (e.g. a client hammering `/rescan` in a loop).
 - It can terminate HTTPS itself, if you'd rather not put a reverse proxy in front of it.
 
-Sonum intentionally has **no built-in concept of playlists, play counts, or user accounts** - it's a metadata/streaming API, and anything about how a listener organizes or tracks their own listening is left entirely up to whatever client you build against it.
+## What Sonum deliberately leaves out
+
+Sonums job stops at "here's what's in the library, and here's how to stream it." It does not have playlists, favorites, play counts/history, or user accounts and thats on purpose, not a missing feature.
+
+Any of those would force a specific, opinionated data model onto every client: how a playlist is ordered, what counts as "played", how accounts and permissions work, where that data lives. Different clients want genuinely different things here a phone app, a car headunit, and a script someone hacks together on a weekend shouldnt have to fight the servers opinion about playlists just to build their own. So instead, Sonum stays a clean read/stream/edit tags layer over your files, and leaves everything about *how a listener uses that library* entirely up to whatever you build on top of it, stored locally on the client, in your own backend, wherever makes sense for what you re building.
+
+If you re building a client and need that kind of state, some options that keep this separation intact:
+
+- Keep it client-side only (local) simplest, and enough for a single device client.
+- Run your own small companion service that stores playlists/history/accounts and calls Sonums API to resolve track ids into actual metadata and streams.
+- Use `/tracks/:id` and the `id` field as a stable key: as long as a tracks `root`/relative path dont change, its `id` doesnt either, so its safe to reference in your own playlist/favorites data.
 
 ## Installation
 
